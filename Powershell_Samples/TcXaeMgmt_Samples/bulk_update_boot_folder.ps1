@@ -35,19 +35,25 @@ function Update-SingleDevice {
         & $ScriptPath -RouteName $DeviceName -SourceFolder $SourceFolder
         
         Write-Log "Successfully updated device: $DeviceName" -Level "SUCCESS"
-        return @{
+        
+        # Return a PSCustomObject instead of hashtable for better CSV compatibility
+        return [PSCustomObject]@{
             Device = $DeviceName
             Status = "Success"
-            Error = $null
+            Error = ""  # Use empty string instead of null
+            Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         }
     }
     catch {
         $errorMsg = $_.Exception.Message
         Write-Log "Failed to update device '$DeviceName': $errorMsg" -Level "ERROR"
-        return @{
+        
+        # Return a PSCustomObject instead of hashtable
+        return [PSCustomObject]@{
             Device = $DeviceName
             Status = "Failed"
             Error = $errorMsg
+            Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         }
     }
 }
@@ -140,9 +146,9 @@ try {
     }
     
     # Summary
-    Write-Log "=" * 60
+    Write-Log ("=" * 60)
     Write-Log "UPDATE SUMMARY"
-    Write-Log "=" * 60
+    Write-Log ("=" * 60)
     
     $successful = $results | Where-Object { $_.Status -eq "Success" }
     $failed = $results | Where-Object { $_.Status -eq "Failed" }
@@ -169,11 +175,27 @@ try {
     
     # Export results to CSV for record keeping
     $csvFile = "update_results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-    $results | Export-Csv -Path $csvFile -NoTypeInformation
-    Write-Log "Detailed results exported to: $csvFile"
     
+    # Ensure we have results to export and they're in the right format
+    if ($results.Count -gt 0) {
+        try {
+            $results | Export-Csv -Path $csvFile -NoTypeInformation
+            Write-Log "Detailed results exported to: $csvFile"
+        }
+        catch {
+            Write-Log "Warning: Could not export results to CSV: $($_.Exception.Message)" -Level "WARN"
+        }
+    }
+    else {
+        Write-Log "No results to export to CSV" -Level "WARN"
+    }
+    
+    # Exit with appropriate code
     if ($failed.Count -gt 0) {
         exit 1
+    }
+    else {
+        exit 0
     }
 }
 catch {

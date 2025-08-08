@@ -1,2 +1,2 @@
-PC-784766
-PC-618B75
+Device1
+Device2
