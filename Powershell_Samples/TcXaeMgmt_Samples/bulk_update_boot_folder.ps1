@@ -1,9 +1,10 @@
 param(
-    [string]$DeviceListFile = "devices.txt",
-    [string]$SourceFolder = "C:\Boot",
+    [string]$DeviceListFile = "devices.csv",
+    [string]$SourceFolder = "C:\temp\Boot",
     [string]$UpdateScript = ".\update_boot_folder.ps1",
     [switch]$Parallel,
-    [int]$MaxConcurrency = 5
+    [int]$MaxConcurrency = 5,
+    [switch]$Force
 )
 
 # Fail fast on any error
@@ -23,35 +24,59 @@ function Write-Log {
 
 function Update-SingleDevice {
     param(
-        [string]$DeviceName,
+        [PSCustomObject]$DeviceInfo,
         [string]$ScriptPath,
-        [string]$SourceFolder
+        [string]$SourceFolder,
+        [bool]$ForceRestart
     )
     
     try {
-        Write-Log "Starting update for device: $DeviceName"
+        $deviceName = $DeviceInfo."Computer Name"
+        $shouldRestart = $DeviceInfo."Restart TwinCAT"
+        
+        Write-Log "Starting update for device: $deviceName (Restart: $shouldRestart)"
+        
+        # Build parameters hashtable for the update script
+        $scriptParams = @{
+            RouteName = $deviceName
+            SourceFolder = $SourceFolder
+        }
+        
+        # Add restart parameter if specified in CSV
+        if ($shouldRestart -eq $true -or $shouldRestart -eq "True" -or $shouldRestart -eq "Y" -or $shouldRestart -eq "Yes" -or $shouldRestart -eq "1") {
+            $scriptParams['Restart'] = $true
+            Write-Log "TwinCAT restart will be performed for: $deviceName"
+        }
+        
+        # Add force parameter if specified at bulk level
+        if ($ForceRestart) {
+            $scriptParams['Force'] = $true
+        }
         
         # Run the update script for this device
-        & $ScriptPath -RouteName $DeviceName -SourceFolder $SourceFolder
+        & $ScriptPath @scriptParams
         
-        Write-Log "Successfully updated device: $DeviceName" -Level "SUCCESS"
+        Write-Log "Successfully updated device: $deviceName" -Level "SUCCESS"
         
-        # Return a PSCustomObject instead of hashtable for better CSV compatibility
+        # Return a PSCustomObject for results tracking
         return [PSCustomObject]@{
-            Device = $DeviceName
+            Device = $deviceName
             Status = "Success"
-            Error = ""  # Use empty string instead of null
+            RestartRequested = $shouldRestart
+            Error = ""
             Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         }
     }
     catch {
         $errorMsg = $_.Exception.Message
-        Write-Log "Failed to update device '$DeviceName': $errorMsg" -Level "ERROR"
+        $deviceName = if ($DeviceInfo."Computer Name") { $DeviceInfo."Computer Name" } else { "Unknown" }
+        Write-Log "Failed to update device '$deviceName': $errorMsg" -Level "ERROR"
         
-        # Return a PSCustomObject instead of hashtable
+        # Return failure result
         return [PSCustomObject]@{
-            Device = $DeviceName
+            Device = $deviceName
             Status = "Failed"
+            RestartRequested = $shouldRestart
             Error = $errorMsg
             Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         }
@@ -72,17 +97,51 @@ try {
         throw "Source folder not found: $SourceFolder"
     }
     
-    # Read device list
-    Write-Log "Reading device list from: $DeviceListFile"
-    $devices = Get-Content $DeviceListFile | Where-Object { 
-        $_.Trim() -ne "" -and -not $_.StartsWith("#") 
+    # Read device list from CSV
+    Write-Log "Reading device list from CSV: $DeviceListFile"
+    try {
+        $devices = Import-Csv $DeviceListFile
+    }
+    catch {
+        throw "Failed to import CSV file '$DeviceListFile': $($_.Exception.Message)"
+    }
+    
+    # Validate CSV structure
+    $requiredColumns = @("Computer Name", "Restart TwinCAT")
+    $csvColumns = $devices[0].PSObject.Properties.Name
+    
+    foreach ($column in $requiredColumns) {
+        if ($column -notin $csvColumns) {
+            throw "Required column '$column' not found in CSV file. Available columns: $($csvColumns -join ', ')"
+        }
+    }
+    
+    # Filter out empty or commented rows
+    $devices = $devices | Where-Object { 
+        $_."Computer Name" -and 
+        $_."Computer Name".Trim() -ne "" -and 
+        -not $_."Computer Name".StartsWith("#") 
     }
     
     if ($devices.Count -eq 0) {
-        throw "No devices found in the device list file"
+        throw "No valid devices found in the CSV file"
     }
     
     Write-Log "Found $($devices.Count) devices to update"
+    
+    # Show restart summary
+    $restartDevices = $devices | Where-Object { 
+        $_."Restart TwinCAT" -eq $true -or 
+        $_."Restart TwinCAT" -eq "True" -or 
+        $_."Restart TwinCAT" -eq "Y" -or 
+        $_."Restart TwinCAT" -eq "Yes" -or 
+        $_."Restart TwinCAT" -eq "1" 
+    }
+    Write-Log "Devices scheduled for TwinCAT restart: $($restartDevices.Count)"
+    
+    if ($Force) {
+        Write-Log "Force mode enabled - TwinCAT restarts will not require confirmation"
+    }
     
     $results = @()
     
@@ -110,13 +169,13 @@ try {
             
             # Start new job
             $job = Start-Job -ScriptBlock {
-                param($DeviceName, $ScriptPath, $SourceFolder, $FunctionDef)
+                param($DeviceInfo, $ScriptPath, $SourceFolder, $ForceRestart, $FunctionDef)
                 
                 # Import the function definition
                 . ([ScriptBlock]::Create($FunctionDef))
                 
-                Update-SingleDevice -DeviceName $DeviceName -ScriptPath $ScriptPath -SourceFolder $SourceFolder
-            } -ArgumentList $device, (Resolve-Path $UpdateScript), $SourceFolder, ${function:Update-SingleDevice}.ToString()
+                Update-SingleDevice -DeviceInfo $DeviceInfo -ScriptPath $ScriptPath -SourceFolder $SourceFolder -ForceRestart $ForceRestart
+            } -ArgumentList $device, (Resolve-Path $UpdateScript).Path, $SourceFolder, $Force.IsPresent, ${function:Update-SingleDevice}.ToString()
             
             $jobs += $job
             $activeJobs++
@@ -140,7 +199,7 @@ try {
         Write-Log "Running updates sequentially"
         
         foreach ($device in $devices) {
-            $result = Update-SingleDevice -DeviceName $device -ScriptPath $UpdateScript -SourceFolder $SourceFolder
+            $result = Update-SingleDevice -DeviceInfo $device -ScriptPath $UpdateScript -SourceFolder $SourceFolder -ForceRestart $Force.IsPresent
             $results += $result
         }
     }
@@ -152,16 +211,19 @@ try {
     
     $successful = $results | Where-Object { $_.Status -eq "Success" }
     $failed = $results | Where-Object { $_.Status -eq "Failed" }
+    $restarted = $results | Where-Object { $_.Status -eq "Success" -and $_.RestartRequested -in @($true, "True", "Y", "Yes", "1") }
     
     Write-Log "Total devices: $($devices.Count)"
     Write-Log "Successful: $($successful.Count)" -Level "SUCCESS"
     Write-Log "Failed: $($failed.Count)" -Level $(if($failed.Count -gt 0) { "ERROR" } else { "INFO" })
+    Write-Log "TwinCAT restarted: $($restarted.Count)" -Level "INFO"
     
     if ($successful.Count -gt 0) {
         Write-Log ""
         Write-Log "Successful updates:"
         foreach ($success in $successful) {
-            Write-Log "  [OK] $($success.Device)" -Level "SUCCESS"
+            $restartStatus = if ($success.RestartRequested -in @($true, "True", "Y", "Yes", "1")) { " (Restarted)" } else { "" }
+            Write-Log "  [OK] $($success.Device)$restartStatus" -Level "SUCCESS"
         }
     }
     
